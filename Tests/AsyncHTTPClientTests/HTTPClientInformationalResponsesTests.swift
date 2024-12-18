@@ -27,7 +27,10 @@ final class HTTPClientReproTests: XCTestCase {
             func channelRead(context: ChannelHandlerContext, data: NIOAny) {
                 switch self.unwrapInboundIn(data) {
                 case .head:
-                    context.writeAndFlush(self.wrapOutboundOut(.head(.init(version: .http1_1, status: .continue))), promise: nil)
+                    context.writeAndFlush(
+                        self.wrapOutboundOut(.head(.init(version: .http1_1, status: .continue))),
+                        promise: nil
+                    )
                 case .body:
                     break
                 case .end:
@@ -37,7 +40,7 @@ final class HTTPClientReproTests: XCTestCase {
             }
         }
 
-        let client = HTTPClient(eventLoopGroupProvider: .createNew)
+        let client = HTTPClient(eventLoopGroupProvider: .singleton)
         defer { XCTAssertNoThrow(try client.syncShutdown()) }
 
         let httpBin = HTTPBin(.http1_1(ssl: false, compress: false)) { _ in
@@ -47,14 +50,16 @@ final class HTTPClientReproTests: XCTestCase {
         let body = #"{"foo": "bar"}"#
 
         var maybeRequest: HTTPClient.Request?
-        XCTAssertNoThrow(maybeRequest = try HTTPClient.Request(
-            url: "http://localhost:\(httpBin.port)/",
-            method: .POST,
-            headers: [
-                "Content-Type": "application/json",
-            ],
-            body: .string(body)
-        ))
+        XCTAssertNoThrow(
+            maybeRequest = try HTTPClient.Request(
+                url: "http://localhost:\(httpBin.port)/",
+                method: .POST,
+                headers: [
+                    "Content-Type": "application/json"
+                ],
+                body: .string(body)
+            )
+        )
         guard let request = maybeRequest else { return XCTFail("Expected to have a request here") }
 
         var logger = Logger(label: "test")
@@ -73,10 +78,14 @@ final class HTTPClientReproTests: XCTestCase {
             func channelRead(context: ChannelHandlerContext, data: NIOAny) {
                 switch self.unwrapInboundIn(data) {
                 case .head:
-                    let head = HTTPResponseHead(version: .http1_1, status: .switchingProtocols, headers: [
-                        "Connection": "Upgrade",
-                        "Upgrade": "Websocket",
-                    ])
+                    let head = HTTPResponseHead(
+                        version: .http1_1,
+                        status: .switchingProtocols,
+                        headers: [
+                            "Connection": "Upgrade",
+                            "Upgrade": "Websocket",
+                        ]
+                    )
                     let body = context.channel.allocator.buffer(string: "foo bar")
 
                     context.write(self.wrapOutboundOut(.head(head)), promise: nil)
@@ -91,7 +100,7 @@ final class HTTPClientReproTests: XCTestCase {
             }
         }
 
-        let client = HTTPClient(eventLoopGroupProvider: .createNew)
+        let client = HTTPClient(eventLoopGroupProvider: .singleton)
         defer { XCTAssertNoThrow(try client.syncShutdown()) }
 
         let httpBin = HTTPBin(.http1_1(ssl: false, compress: false)) { _ in
@@ -101,14 +110,16 @@ final class HTTPClientReproTests: XCTestCase {
         let body = #"{"foo": "bar"}"#
 
         var maybeRequest: HTTPClient.Request?
-        XCTAssertNoThrow(maybeRequest = try HTTPClient.Request(
-            url: "http://localhost:\(httpBin.port)/",
-            method: .POST,
-            headers: [
-                "Content-Type": "application/json",
-            ],
-            body: .string(body)
-        ))
+        XCTAssertNoThrow(
+            maybeRequest = try HTTPClient.Request(
+                url: "http://localhost:\(httpBin.port)/",
+                method: .POST,
+                headers: [
+                    "Content-Type": "application/json"
+                ],
+                body: .string(body)
+            )
+        )
         guard let request = maybeRequest else { return XCTFail("Expected to have a request here") }
 
         var logger = Logger(label: "test")

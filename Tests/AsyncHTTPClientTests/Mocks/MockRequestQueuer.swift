@@ -12,10 +12,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-@testable import AsyncHTTPClient
 import Logging
 import NIOCore
 import NIOHTTP1
+
+@testable import AsyncHTTPClient
 
 /// A mock request queue (not creating any timers) that is used to validate
 /// request actions returned by the `HTTPConnectionPool.StateMachine`.
@@ -82,11 +83,11 @@ struct MockRequestQueuer {
         return waiter.request
     }
 
-    mutating func timeoutRandomRequest() -> RequestID? {
-        guard let waiterID = self.waiters.randomElement().map(\.0) else {
+    mutating func timeoutRandomRequest() -> (RequestID, HTTPSchedulableRequest)? {
+        guard let waiter = self.waiters.randomElement() else {
             return nil
         }
-        self.waiters.removeValue(forKey: waiterID)
-        return waiterID
+        self.waiters.removeValue(forKey: waiter.key)
+        return (waiter.key, waiter.value.request)
     }
 }

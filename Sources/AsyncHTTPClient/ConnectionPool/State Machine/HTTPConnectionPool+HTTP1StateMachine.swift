@@ -17,6 +17,7 @@ import NIOCore
 extension HTTPConnectionPool {
     struct HTTP1StateMachine {
         typealias Action = HTTPConnectionPool.StateMachine.Action
+        typealias RequestAction = HTTPConnectionPool.StateMachine.RequestAction
         typealias ConnectionMigrationAction = HTTPConnectionPool.StateMachine.ConnectionMigrationAction
         typealias EstablishedAction = HTTPConnectionPool.StateMachine.EstablishedAction
         typealias EstablishedConnectionAction = HTTPConnectionPool.StateMachine.EstablishedConnectionAction
@@ -29,16 +30,23 @@ extension HTTPConnectionPool {
 
         private(set) var requests: RequestQueue
         private(set) var lifecycleState: StateMachine.LifecycleState
+        /// The property was introduced to fail fast during testing.
+        /// Otherwise this should always be true and not turned off.
+        private let retryConnectionEstablishment: Bool
 
         init(
             idGenerator: Connection.ID.Generator,
             maximumConcurrentConnections: Int,
+            retryConnectionEstablishment: Bool,
+            maximumConnectionUses: Int?,
             lifecycleState: StateMachine.LifecycleState
         ) {
             self.connections = HTTP1Connections(
                 maximumConcurrentConnections: maximumConcurrentConnections,
-                generator: idGenerator
+                generator: idGenerator,
+                maximumConnectionUses: maximumConnectionUses
             )
+            self.retryConnectionEstablishment = retryConnectionEstablishment
 
             self.requests = RequestQueue()
             self.lifecycleState = lifecycleState
@@ -72,7 +80,10 @@ extension HTTPConnectionPool {
             requests: RequestQueue
         ) -> ConnectionMigrationAction {
             precondition(self.connections.isEmpty, "expected an empty state machine but connections are not empty")
-            precondition(self.http2Connections == nil, "expected an empty state machine but http2Connections are not nil")
+            precondition(
+                self.http2Connections == nil,
+                "expected an empty state machine but http2Connections are not nil"
+            )
             precondition(self.requests.isEmpty, "expected an empty state machine but requests are not empty")
 
             self.requests = requests
@@ -92,7 +103,8 @@ extension HTTPConnectionPool {
 
             let createConnections = self.connections.createConnectionsAfterMigrationIfNeeded(
                 requiredEventLoopOfPendingRequests: requests.requestCountGroupedByRequiredEventLoop(),
-                generalPurposeRequestCountGroupedByPreferredEventLoop: requests.generalPurposeRequestCountGroupedByPreferredEventLoop()
+                generalPurposeRequestCountGroupedByPreferredEventLoop:
+                    requests.generalPurposeRequestCountGroupedByPreferredEventLoop()
             )
 
             if !http2Connections.isEmpty {
@@ -219,6 +231,19 @@ extension HTTPConnectionPool {
 
             switch self.lifecycleState {
             case .running:
+                guard self.retryConnectionEstablishment else {
+                    guard let (index, _) = self.connections.failConnection(connectionID) else {
+                        preconditionFailure(
+                            "A connection attempt failed, that the state machine knows nothing about. Somewhere state was lost."
+                        )
+                    }
+                    self.connections.removeConnection(at: index)
+
+                    return .init(
+                        request: self.failAllRequests(reason: error),
+                        connection: .none
+                    )
+                }
                 // We don't care how many waiting requests we have at this point, we will schedule a
                 // retry. More tasks, may appear until the backoff has completed. The final
                 // decision about the retry will be made in `connectionCreationBackoffDone(_:)`
@@ -239,6 +264,12 @@ extension HTTPConnectionPool {
             case .shutDown:
                 preconditionFailure("The pool is already shutdown all connections must already been torn down")
             }
+        }
+
+        mutating func waitingForConnectivity(_ error: Error, connectionID: Connection.ID) -> Action {
+            self.lastConnectFailure = error
+
+            return .init(request: .none, connection: .none)
         }
 
         mutating func connectionCreationBackoffDone(_ connectionID: Connection.ID) -> Action {
@@ -270,7 +301,10 @@ extension HTTPConnectionPool {
                 return .none
             }
 
-            precondition(self.lifecycleState == .running, "If we are shutting down, we must not have any idle connections")
+            precondition(
+                self.lifecycleState == .running,
+                "If we are shutting down, we must not have any idle connections"
+            )
 
             return .init(
                 request: .none,
@@ -317,9 +351,11 @@ extension HTTPConnectionPool {
 
         mutating func cancelRequest(_ requestID: Request.ID) -> Action {
             // 1. check requests in queue
-            if self.requests.remove(requestID) != nil {
+            if let request = self.requests.remove(requestID) {
+                // Use the last connection error to let the user know why the request was never scheduled
+                let error = self.lastConnectFailure ?? HTTPClientError.cancelled
                 return .init(
-                    request: .cancelRequestTimeout(requestID),
+                    request: .failRequest(request, error, cancelTimeout: true),
                     connection: .none
                 )
             }
@@ -372,11 +408,20 @@ extension HTTPConnectionPool {
         ) -> EstablishedAction {
             switch self.lifecycleState {
             case .running:
-                switch context.use {
-                case .generalPurpose:
-                    return self.nextActionForIdleGeneralPurposeConnection(at: index, context: context)
-                case .eventLoop:
-                    return self.nextActionForIdleEventLoopConnection(at: index, context: context)
+                // Close the connection if it's expired.
+                if context.shouldBeClosed {
+                    let connection = self.connections.closeConnection(at: index)
+                    return .init(
+                        request: .none,
+                        connection: .closeConnection(connection, isShutdown: .no)
+                    )
+                } else {
+                    switch context.use {
+                    case .generalPurpose:
+                        return self.nextActionForIdleGeneralPurposeConnection(at: index, context: context)
+                    case .eventLoop:
+                        return self.nextActionForIdleEventLoopConnection(at: index, context: context)
+                    }
                 }
             case .shuttingDown(let unclean):
                 assert(self.requests.isEmpty)
@@ -515,9 +560,18 @@ extension HTTPConnectionPool {
             return .none
         }
 
+        private mutating func failAllRequests(reason error: Error) -> RequestAction {
+            let allRequests = self.requests.removeAll()
+            guard !allRequests.isEmpty else {
+                return .none
+            }
+            return .failRequestsAndCancelTimeouts(allRequests, error)
+        }
+
         // MARK: HTTP2
 
-        mutating func newHTTP2MaxConcurrentStreamsReceived(_ connectionID: Connection.ID, newMaxStreams: Int) -> Action {
+        mutating func newHTTP2MaxConcurrentStreamsReceived(_ connectionID: Connection.ID, newMaxStreams: Int) -> Action
+        {
             // The `http2Connections` are optional here:
             // Connections report events back to us, if they are in a shutdown that was
             // initiated by the state machine. For this reason this callback might be invoked
@@ -619,6 +673,7 @@ extension HTTPConnectionPool.HTTP1StateMachine: CustomStringConvertible {
         let stats = self.connections.stats
         let queued = self.requests.count
 
-        return "connections: [connecting: \(stats.connecting) | backoff: \(stats.backingOff) | leased: \(stats.leased) | idle: \(stats.idle)], queued: \(queued)"
+        return
+            "connections: [connecting: \(stats.connecting) | backoff: \(stats.backingOff) | leased: \(stats.leased) | idle: \(stats.idle)], queued: \(queued)"
     }
 }

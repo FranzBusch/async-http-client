@@ -12,11 +12,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-@testable import AsyncHTTPClient
 import NIOCore
 import NIOEmbedded
 import NIOHTTP1
 import XCTest
+
+@testable import AsyncHTTPClient
 
 class HTTP1ProxyConnectHandlerTests: XCTestCase {
     func testProxyConnectWithoutAuthorizationSuccess() {
@@ -43,6 +44,7 @@ class HTTP1ProxyConnectHandlerTests: XCTestCase {
 
         XCTAssertEqual(head.method, .CONNECT)
         XCTAssertEqual(head.uri, "swift.org:443")
+        XCTAssertEqual(head.headers["host"].first, "swift.org")
         XCTAssertNil(head.headers["proxy-authorization"].first)
         XCTAssertEqual(try embedded.readOutbound(as: HTTPClientRequestPart.self), .end(nil))
 
@@ -76,6 +78,7 @@ class HTTP1ProxyConnectHandlerTests: XCTestCase {
 
         XCTAssertEqual(head.method, .CONNECT)
         XCTAssertEqual(head.uri, "swift.org:443")
+        XCTAssertEqual(head.headers["host"].first, "swift.org")
         XCTAssertEqual(head.headers["proxy-authorization"].first, "Basic abc123")
         XCTAssertEqual(try embedded.readOutbound(as: HTTPClientRequestPart.self), .end(nil))
 
@@ -109,6 +112,7 @@ class HTTP1ProxyConnectHandlerTests: XCTestCase {
 
         XCTAssertEqual(head.method, .CONNECT)
         XCTAssertEqual(head.uri, "swift.org:443")
+        XCTAssertEqual(head.headers["host"].first, "swift.org")
         XCTAssertNil(head.headers["proxy-authorization"].first)
         XCTAssertEqual(try embedded.readOutbound(as: HTTPClientRequestPart.self), .end(nil))
 
@@ -148,6 +152,7 @@ class HTTP1ProxyConnectHandlerTests: XCTestCase {
 
         XCTAssertEqual(head.method, .CONNECT)
         XCTAssertEqual(head.uri, "swift.org:443")
+        XCTAssertEqual(head.headers["host"].first, "swift.org")
         XCTAssertNil(head.headers["proxy-authorization"].first)
         XCTAssertEqual(try embedded.readOutbound(as: HTTPClientRequestPart.self), .end(nil))
 
@@ -187,6 +192,7 @@ class HTTP1ProxyConnectHandlerTests: XCTestCase {
 
         XCTAssertEqual(head.method, .CONNECT)
         XCTAssertEqual(head.uri, "swift.org:443")
+        XCTAssertEqual(head.headers["host"].first, "swift.org")
         XCTAssertEqual(try embedded.readOutbound(as: HTTPClientRequestPart.self), .end(nil))
 
         let responseHead = HTTPResponseHead(version: .http1_1, status: .ok)

@@ -12,7 +12,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if compiler(>=5.5.2) && canImport(_Concurrency)
 import Logging
 import NIOConcurrencyHelpers
 import NIOCore
@@ -20,7 +19,11 @@ import NIOHTTP1
 import NIOSSL
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
-final class Transaction: @unchecked Sendable {
+@usableFromInline
+final class Transaction:
+    // until NIOLockedValueBox learns `sending` because StateMachine cannot be Sendable
+    @unchecked Sendable
+{
     let logger: Logger
 
     let request: HTTPClientRequest.Prepared
@@ -29,8 +32,7 @@ final class Transaction: @unchecked Sendable {
     let preferredEventLoop: EventLoop
     let requestOptions: RequestOptions
 
-    private let stateLock = Lock()
-    private var state: StateMachine
+    private let state: NIOLockedValueBox<StateMachine>
 
     init(
         request: HTTPClientRequest.Prepared,
@@ -45,11 +47,11 @@ final class Transaction: @unchecked Sendable {
         self.logger = logger
         self.connectionDeadline = connectionDeadline
         self.preferredEventLoop = preferredEventLoop
-        self.state = StateMachine(responseContinuation)
+        self.state = NIOLockedValueBox(StateMachine(responseContinuation))
     }
 
     func cancel() {
-        self.fail(HTTPClientError.cancelled)
+        self.fail(CancellationError())
     }
 
     // MARK: Request body helpers
@@ -57,13 +59,13 @@ final class Transaction: @unchecked Sendable {
     private func writeOnceAndOneTimeOnly(byteBuffer: ByteBuffer) {
         // This method is synchronously invoked after sending the request head. For this reason we
         // can make a number of assumptions, how the state machine will react.
-        let writeAction = self.stateLock.withLock {
-            self.state.writeNextRequestPart()
+        let writeAction = self.state.withLockedValue { state in
+            state.writeNextRequestPart()
         }
 
         switch writeAction {
         case .writeAndWait(let executor), .writeAndContinue(let executor):
-            executor.writeRequestBodyPart(.byteBuffer(byteBuffer), request: self)
+            executor.writeRequestBodyPart(.byteBuffer(byteBuffer), request: self, promise: nil)
 
         case .fail:
             // an error/cancellation has happened. we don't need to continue here
@@ -100,30 +102,33 @@ final class Transaction: @unchecked Sendable {
 
     struct BreakTheWriteLoopError: Swift.Error {}
 
+    // FIXME: Refactor this to not use `self.state.unsafe`.
     private func writeRequestBodyPart(_ part: ByteBuffer) async throws {
-        self.stateLock.lock()
-        switch self.state.writeNextRequestPart() {
+        self.state.unsafe.lock()
+        switch self.state.unsafe.withValueAssumingLockIsAcquired({ state in state.writeNextRequestPart() }) {
         case .writeAndContinue(let executor):
-            self.stateLock.unlock()
-            executor.writeRequestBodyPart(.byteBuffer(part), request: self)
+            self.state.unsafe.unlock()
+            executor.writeRequestBodyPart(.byteBuffer(part), request: self, promise: nil)
 
         case .writeAndWait(let executor):
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self.state.waitForRequestBodyDemand(continuation: continuation)
-                self.stateLock.unlock()
+                self.state.unsafe.withValueAssumingLockIsAcquired({ state in
+                    state.waitForRequestBodyDemand(continuation: continuation)
+                })
+                self.state.unsafe.unlock()
 
-                executor.writeRequestBodyPart(.byteBuffer(part), request: self)
+                executor.writeRequestBodyPart(.byteBuffer(part), request: self, promise: nil)
             }
 
         case .fail:
-            self.stateLock.unlock()
+            self.state.unsafe.unlock()
             throw BreakTheWriteLoopError()
         }
     }
 
     private func requestBodyStreamFinished() {
-        let finishAction = self.stateLock.withLock {
-            self.state.finishRequestBodyStream()
+        let finishAction = self.state.withLockedValue { state in
+            state.finishRequestBodyStream()
         }
 
         switch finishAction {
@@ -131,9 +136,8 @@ final class Transaction: @unchecked Sendable {
             // an error/cancellation has happened. nothing to do.
             break
 
-        case .forwardStreamFinished(let executor, let succeedContinuation):
-            executor.finishRequestBodyStream(self)
-            succeedContinuation?.resume(returning: nil)
+        case .forwardStreamFinished(let executor):
+            executor.finishRequestBodyStream(self, promise: nil)
         }
         return
     }
@@ -148,12 +152,12 @@ final class Transaction: @unchecked Sendable {
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 extension Transaction: HTTPSchedulableRequest {
     var poolKey: ConnectionPool.Key { self.request.poolKey }
-    var tlsConfiguration: TLSConfiguration? { return nil }
-    var requiredEventLoop: EventLoop? { return nil }
+    var tlsConfiguration: TLSConfiguration? { self.request.tlsConfiguration }
+    var requiredEventLoop: EventLoop? { nil }
 
     func requestWasQueued(_ scheduler: HTTPRequestScheduler) {
-        self.stateLock.withLock {
-            self.state.requestWasQueued(scheduler)
+        self.state.withLockedValue { state in
+            state.requestWasQueued(scheduler)
         }
     }
 }
@@ -167,14 +171,16 @@ extension Transaction: HTTPExecutableRequest {
     // MARK: Request
 
     func willExecuteRequest(_ executor: HTTPRequestExecutor) {
-        let action = self.stateLock.withLock {
-            self.state.willExecuteRequest(executor)
+        let action = self.state.withLockedValue { state in
+            state.willExecuteRequest(executor)
         }
 
         switch action {
         case .cancel(let executor):
             executor.cancelRequest(self)
-
+        case .cancelAndFail(let executor, let continuation, with: let error):
+            executor.cancelRequest(self)
+            continuation.resume(throwing: error)
         case .none:
             break
         }
@@ -183,8 +189,8 @@ extension Transaction: HTTPExecutableRequest {
     func requestHeadSent() {}
 
     func resumeRequestBodyStream() {
-        let action = self.stateLock.withLock {
-            self.state.resumeRequestBodyStream()
+        let action = self.state.withLockedValue { state in
+            state.resumeRequestBodyStream()
         }
 
         switch action {
@@ -192,7 +198,7 @@ extension Transaction: HTTPExecutableRequest {
             break
 
         case .startStream(let allocator):
-            switch self.request.body?.mode {
+            switch self.request.body {
             case .asyncSequence(_, let next):
                 // it is safe to call this async here. it dispatches...
                 self.continueRequestBodyStream(allocator, next: next)
@@ -214,62 +220,70 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func pauseRequestBodyStream() {
-        self.stateLock.withLock {
-            self.state.pauseRequestBodyStream()
+        self.state.withLockedValue { state in
+            state.pauseRequestBodyStream()
         }
     }
 
     // MARK: Response
 
     func receiveResponseHead(_ head: HTTPResponseHead) {
-        let action = self.stateLock.withLock {
-            self.state.receiveResponseHead(head)
+        let action = self.state.withLockedValue { state in
+            state.receiveResponseHead(head, delegate: self)
         }
 
         switch action {
         case .none:
             break
 
-        case .succeedResponseHead(let head, let continuation):
-            let asyncResponse = HTTPClientResponse(
-                bag: self,
+        case .succeedResponseHead(let body, let continuation):
+            let response = HTTPClientResponse(
+                requestMethod: self.requestHead.method,
                 version: head.version,
                 status: head.status,
-                headers: head.headers
+                headers: head.headers,
+                body: body
             )
-            continuation.resume(returning: asyncResponse)
+            continuation.resume(returning: response)
         }
     }
 
     func receiveResponseBodyParts(_ buffer: CircularBuffer<ByteBuffer>) {
-        let action = self.stateLock.withLock {
-            self.state.receiveResponseBodyParts(buffer)
+        let action = self.state.withLockedValue { state in
+            state.receiveResponseBodyParts(buffer)
         }
         switch action {
         case .none:
             break
-        case .succeedContinuation(let continuation, let bytes):
-            continuation.resume(returning: bytes)
+        case .yieldResponseBodyParts(let source, let responseBodyParts, let executer):
+            switch source.yield(contentsOf: responseBodyParts) {
+            case .dropped, .stopProducing:
+                break
+            case .produceMore:
+                executer.demandResponseBodyStream(self)
+            }
         }
     }
 
     func succeedRequest(_ buffer: CircularBuffer<ByteBuffer>?) {
-        let succeedAction = self.stateLock.withLock {
-            self.state.succeedRequest(buffer)
+        let succeedAction = self.state.withLockedValue { state in
+            state.succeedRequest(buffer)
         }
         switch succeedAction {
-        case .finishResponseStream(let continuation):
-            continuation.resume(returning: nil)
-        case .succeedContinuation(let continuation, let byteBuffer):
-            continuation.resume(returning: byteBuffer)
+        case .finishResponseStream(let source, let finalResponse):
+            if let finalResponse = finalResponse {
+                _ = source.yield(contentsOf: finalResponse)
+            }
+            source.finish()
+
         case .none:
             break
         }
     }
 
     func fail(_ error: Error) {
-        let action = self.stateLock.withLock {
-            self.state.fail(error)
+        let action = self.state.withLockedValue { state in
+            state.fail(error)
         }
         self.performFailAction(action)
     }
@@ -282,12 +296,12 @@ extension Transaction: HTTPExecutableRequest {
         case .failResponseHead(let continuation, let error, let scheduler, let executor, let bodyStreamContinuation):
             continuation.resume(throwing: error)
             bodyStreamContinuation?.resume(throwing: error)
-            scheduler?.cancelRequest(self) // NOTE: scheduler and executor are exclusive here
+            scheduler?.cancelRequest(self)  // NOTE: scheduler and executor are exclusive here
             executor?.cancelRequest(self)
 
-        case .failResponseStream(let continuation, let error, let executor, let bodyStreamContinuation):
-            continuation.resume(throwing: error)
-            bodyStreamContinuation?.resume(throwing: error)
+        case .failResponseStream(let source, let error, let executor, let requestBodyStreamContinuation):
+            source.finish(error)
+            requestBodyStreamContinuation?.resume(throwing: error)
             executor.cancelRequest(self)
 
         case .failRequestStreamContinuation(let bodyStreamContinuation, let error):
@@ -296,8 +310,8 @@ extension Transaction: HTTPExecutableRequest {
     }
 
     func deadlineExceeded() {
-        let action = self.stateLock.withLock {
-            self.state.deadlineExceeded()
+        let action = self.state.withLockedValue { state in
+            state.deadlineExceeded()
         }
         self.performDeadlineExceededAction(action)
     }
@@ -309,7 +323,8 @@ extension Transaction: HTTPExecutableRequest {
             scheduler?.cancelRequest(self)
             executor?.cancelRequest(self)
             bodyStreamContinuation?.resume(throwing: HTTPClientError.deadlineExceeded)
-
+        case .cancelSchedulerOnly(let scheduler):
+            scheduler.cancelRequest(self)
         case .none:
             break
         }
@@ -317,46 +332,22 @@ extension Transaction: HTTPExecutableRequest {
 }
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
-extension Transaction {
-    func responseBodyDeinited() {
-        let deinitedAction = self.stateLock.withLock {
-            self.state.responseBodyDeinited()
+extension Transaction: NIOAsyncSequenceProducerDelegate {
+    @usableFromInline
+    func produceMore() {
+        let action = self.state.withLockedValue { state in
+            state.produceMore()
         }
-
-        switch deinitedAction {
-        case .cancel(let executor):
-            executor.cancelRequest(self)
+        switch action {
         case .none:
             break
+        case .requestMoreResponseBodyParts(let executer):
+            executer.demandResponseBodyStream(self)
         }
     }
 
-    func nextResponsePart(streamID: HTTPClientResponse.Body.IteratorStream.ID) async throws -> ByteBuffer? {
-        try await withCheckedThrowingContinuation { continuation in
-            let action = self.stateLock.withLock {
-                self.state.consumeNextResponsePart(streamID: streamID, continuation: continuation)
-            }
-            switch action {
-            case .succeedContinuation(let continuation, let result):
-                continuation.resume(returning: result)
-
-            case .failContinuation(let continuation, let error):
-                continuation.resume(throwing: error)
-
-            case .askExecutorForMore(let executor):
-                executor.demandResponseBodyStream(self)
-
-            case .none:
-                return
-            }
-        }
-    }
-
-    func responseBodyIteratorDeinited(streamID: HTTPClientResponse.Body.IteratorStream.ID) {
-        let action = self.stateLock.withLock {
-            self.state.responseBodyIteratorDeinited(streamID: streamID)
-        }
-        self.performFailAction(action)
+    @usableFromInline
+    func didTerminate() {
+        self.fail(HTTPClientError.cancelled)
     }
 }
-#endif
