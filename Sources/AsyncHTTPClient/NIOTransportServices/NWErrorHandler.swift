@@ -12,15 +12,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if canImport(Network)
-import Network
-#endif
 import NIOCore
 import NIOHTTP1
 import NIOTransportServices
 
+#if canImport(Network)
+import Network
+#endif
+
 extension HTTPClient {
     #if canImport(Network)
+    /// A wrapper for `POSIX` errors thrown by `Network.framework`.
     public struct NWPOSIXError: Error, CustomStringConvertible {
         /// POSIX error code (enum)
         public let errorCode: POSIXErrorCode
@@ -37,11 +39,12 @@ extension HTTPClient {
             self.reason = reason
         }
 
-        public var description: String { return self.reason }
+        public var description: String { self.reason }
     }
 
+    /// A wrapper for TLS errors thrown by `Network.framework`.
     public struct NWTLSError: Error, CustomStringConvertible {
-        /// TLS error status. List of TLS errors can be found in <Security/SecureTransport.h>
+        /// TLS error status. List of TLS errors can be found in `<Security/SecureTransport.h>`
         public let status: OSStatus
 
         /// actual reason, in human readable form
@@ -56,11 +59,11 @@ extension HTTPClient {
             self.reason = reason
         }
 
-        public var description: String { return self.reason }
+        public var description: String { self.reason }
     }
     #endif
 
-    class NWErrorHandler: ChannelInboundHandler {
+    final class NWErrorHandler: ChannelInboundHandler {
         typealias InboundIn = HTTPClientResponsePart
 
         func errorCaught(context: ChannelHandlerContext, error: Error) {
@@ -73,9 +76,9 @@ extension HTTPClient {
                 if let error = error as? NWError {
                     switch error {
                     case .tls(let status):
-                        return NWTLSError(status, reason: error.localizedDescription)
+                        return NWTLSError(status, reason: String(describing: error))
                     case .posix(let errorCode):
-                        return NWPOSIXError(errorCode, reason: error.localizedDescription)
+                        return NWPOSIXError(errorCode, reason: String(describing: error))
                     default:
                         return error
                     }

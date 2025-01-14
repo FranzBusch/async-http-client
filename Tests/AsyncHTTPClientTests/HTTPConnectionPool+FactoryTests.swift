@@ -12,7 +12,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-@testable import AsyncHTTPClient
 import Logging
 import NIOCore
 import NIOPosix
@@ -20,18 +19,22 @@ import NIOSOCKS
 import NIOSSL
 import XCTest
 
+@testable import AsyncHTTPClient
+
 class HTTPConnectionPool_FactoryTests: XCTestCase {
     func testConnectionCreationTimesoutIfDeadlineIsInThePast() {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
 
         var server: Channel?
-        XCTAssertNoThrow(server = try ServerBootstrap(group: group)
-            .childChannelInitializer { channel in
-                channel.pipeline.addHandler(NeverrespondServerHandler())
-            }
-            .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
-            .wait())
+        XCTAssertNoThrow(
+            server = try ServerBootstrap(group: group)
+                .childChannelInitializer { channel in
+                    channel.pipeline.addHandler(NeverrespondServerHandler())
+                }
+                .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
+                .wait()
+        )
         defer {
             XCTAssertNoThrow(try server?.close().wait())
         }
@@ -45,12 +48,14 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
             sslContextCache: .init()
         )
 
-        XCTAssertThrowsError(try factory.makeChannel(
-            connectionID: 1,
-            deadline: .now() - .seconds(1),
-            eventLoop: group.next(),
-            logger: .init(label: "test")
-        ).wait()
+        XCTAssertThrowsError(
+            try factory.makeChannel(
+                requester: ExplodingRequester(),
+                connectionID: 1,
+                deadline: .now() - .seconds(1),
+                eventLoop: group.next(),
+                logger: .init(label: "test")
+            ).wait()
         ) {
             XCTAssertEqual($0 as? HTTPClientError, .connectTimeout)
         }
@@ -61,12 +66,14 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
 
         var server: Channel?
-        XCTAssertNoThrow(server = try ServerBootstrap(group: group)
-            .childChannelInitializer { channel in
-                channel.pipeline.addHandler(NeverrespondServerHandler())
-            }
-            .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
-            .wait())
+        XCTAssertNoThrow(
+            server = try ServerBootstrap(group: group)
+                .childChannelInitializer { channel in
+                    channel.pipeline.addHandler(NeverrespondServerHandler())
+                }
+                .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
+                .wait()
+        )
         defer {
             XCTAssertNoThrow(try server?.close().wait())
         }
@@ -76,16 +83,19 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         let factory = HTTPConnectionPool.ConnectionFactory(
             key: .init(request),
             tlsConfiguration: nil,
-            clientConfiguration: .init(proxy: .socksServer(host: "127.0.0.1", port: server!.localAddress!.port!)),
+            clientConfiguration: .init(proxy: .socksServer(host: "127.0.0.1", port: server!.localAddress!.port!))
+                .enableFastFailureModeForTesting(),
             sslContextCache: .init()
         )
 
-        XCTAssertThrowsError(try factory.makeChannel(
-            connectionID: 1,
-            deadline: .now() + .seconds(1),
-            eventLoop: group.next(),
-            logger: .init(label: "test")
-        ).wait()
+        XCTAssertThrowsError(
+            try factory.makeChannel(
+                requester: ExplodingRequester(),
+                connectionID: 1,
+                deadline: .now() + .seconds(1),
+                eventLoop: group.next(),
+                logger: .init(label: "test")
+            ).wait()
         ) {
             XCTAssertEqual($0 as? HTTPClientError, .socksHandshakeTimeout)
         }
@@ -96,12 +106,14 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
 
         var server: Channel?
-        XCTAssertNoThrow(server = try ServerBootstrap(group: group)
-            .childChannelInitializer { channel in
-                channel.pipeline.addHandler(NeverrespondServerHandler())
-            }
-            .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
-            .wait())
+        XCTAssertNoThrow(
+            server = try ServerBootstrap(group: group)
+                .childChannelInitializer { channel in
+                    channel.pipeline.addHandler(NeverrespondServerHandler())
+                }
+                .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
+                .wait()
+        )
         defer {
             XCTAssertNoThrow(try server?.close().wait())
         }
@@ -111,16 +123,19 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         let factory = HTTPConnectionPool.ConnectionFactory(
             key: .init(request),
             tlsConfiguration: nil,
-            clientConfiguration: .init(proxy: .server(host: "127.0.0.1", port: server!.localAddress!.port!)),
+            clientConfiguration: .init(proxy: .server(host: "127.0.0.1", port: server!.localAddress!.port!))
+                .enableFastFailureModeForTesting(),
             sslContextCache: .init()
         )
 
-        XCTAssertThrowsError(try factory.makeChannel(
-            connectionID: 1,
-            deadline: .now() + .seconds(1),
-            eventLoop: group.next(),
-            logger: .init(label: "test")
-        ).wait()
+        XCTAssertThrowsError(
+            try factory.makeChannel(
+                requester: ExplodingRequester(),
+                connectionID: 1,
+                deadline: .now() + .seconds(1),
+                eventLoop: group.next(),
+                logger: .init(label: "test")
+            ).wait()
         ) {
             XCTAssertEqual($0 as? HTTPClientError, .httpProxyHandshakeTimeout)
         }
@@ -131,12 +146,14 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
 
         var server: Channel?
-        XCTAssertNoThrow(server = try ServerBootstrap(group: group)
-            .childChannelInitializer { channel in
-                channel.pipeline.addHandler(NeverrespondServerHandler())
-            }
-            .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
-            .wait())
+        XCTAssertNoThrow(
+            server = try ServerBootstrap(group: group)
+                .childChannelInitializer { channel in
+                    channel.pipeline.addHandler(NeverrespondServerHandler())
+                }
+                .bind(to: .init(ipAddress: "127.0.0.1", port: 0))
+                .wait()
+        )
         defer {
             XCTAssertNoThrow(try server?.close().wait())
         }
@@ -148,16 +165,19 @@ class HTTPConnectionPool_FactoryTests: XCTestCase {
         let factory = HTTPConnectionPool.ConnectionFactory(
             key: .init(request),
             tlsConfiguration: nil,
-            clientConfiguration: .init(tlsConfiguration: tlsConfig),
+            clientConfiguration: .init(tlsConfiguration: tlsConfig)
+                .enableFastFailureModeForTesting(),
             sslContextCache: .init()
         )
 
-        XCTAssertThrowsError(try factory.makeChannel(
-            connectionID: 1,
-            deadline: .now() + .seconds(1),
-            eventLoop: group.next(),
-            logger: .init(label: "test")
-        ).wait()
+        XCTAssertThrowsError(
+            try factory.makeChannel(
+                requester: ExplodingRequester(),
+                connectionID: 1,
+                deadline: .now() + .seconds(1),
+                eventLoop: group.next(),
+                logger: .init(label: "test")
+            ).wait()
         ) {
             XCTAssertEqual($0 as? HTTPClientError, .tlsHandshakeTimeout)
         }
@@ -169,5 +189,24 @@ class NeverrespondServerHandler: ChannelInboundHandler {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         // do nothing
+    }
+}
+
+/// A `HTTPConnectionRequester` that will fail a test if any of its methods are ever called.
+final class ExplodingRequester: HTTPConnectionRequester {
+    func http1ConnectionCreated(_: HTTP1Connection) {
+        XCTFail("http1ConnectionCreated called unexpectedly")
+    }
+
+    func http2ConnectionCreated(_: HTTP2Connection, maximumStreams: Int) {
+        XCTFail("http2ConnectionCreated called unexpectedly")
+    }
+
+    func failedToCreateHTTPConnection(_: HTTPConnectionPool.Connection.ID, error: Error) {
+        XCTFail("failedToCreateHTTPConnection called unexpectedly")
+    }
+
+    func waitingForConnectivity(_: HTTPConnectionPool.Connection.ID, error: Error) {
+        XCTFail("waitingForConnectivity called unexpectedly")
     }
 }

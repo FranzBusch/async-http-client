@@ -12,24 +12,26 @@
 //
 //===----------------------------------------------------------------------===//
 
-@testable import AsyncHTTPClient
 import Logging
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
+import NIOFoundationCompat
 import NIOHTTP1
 import NIOPosix
 import XCTest
 
-#if compiler(>=5.5.2) && canImport(_Concurrency)
+@testable import AsyncHTTPClient
+
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 typealias PreparedRequest = HTTPClientRequest.Prepared
-#endif
 
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 final class TransactionTests: XCTestCase {
     func testCancelAsyncRequest() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
+        // creating the `XCTestExpectation` off the main thread crashes on Linux with Swift 5.6
+        // therefore we create it here as a workaround which works fine
+        let scheduledRequestCanceled = self.expectation(description: "scheduled request canceled")
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -41,7 +43,46 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return XCTFail("Expected to have a request here.")
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
+                request: preparedRequest,
+                preferredEventLoop: embeddedEventLoop
+            )
+
+            let queuer = MockTaskQueuer { _ in
+                scheduledRequestCanceled.fulfill()
+            }
+            transaction.requestWasQueued(queuer)
+
+            XCTAssertEqual(queuer.hitCancelCount, 0)
+            Task.detached {
+                try await Task.sleep(nanoseconds: 5 * 1000 * 1000)
+                transaction.cancel()
+            }
+
+            await XCTAssertThrowsError(try await responseTask.value) { error in
+                XCTAssertTrue(error is CancellationError, "unexpected error \(error)")
+            }
+
+            // self.fulfillment(of:) is not available on Linux
+            _ = {
+                self.wait(for: [scheduledRequestCanceled], timeout: 1)
+            }()
+        }
+    }
+
+    func testDeadlineExceededWhileQueuedAndExecutorImmediatelyCancelsTask() {
+        XCTAsyncTest {
+            let embeddedEventLoop = EmbeddedEventLoop()
+            defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
+
+            var request = HTTPClientRequest(url: "https://localhost/")
+            request.method = .GET
+            var maybePreparedRequest: PreparedRequest?
+            XCTAssertNoThrow(maybePreparedRequest = try PreparedRequest(request))
+            guard let preparedRequest = maybePreparedRequest else {
+                return XCTFail("Expected to have a request here.")
+            }
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -49,23 +90,42 @@ final class TransactionTests: XCTestCase {
             let queuer = MockTaskQueuer()
             transaction.requestWasQueued(queuer)
 
-            Task.detached {
-                try await Task.sleep(nanoseconds: 5 * 1000 * 1000)
-                transaction.cancel()
+            transaction.deadlineExceeded()
+
+            struct Executor: HTTPRequestExecutor {
+                func writeRequestBodyPart(
+                    _: NIOCore.IOData,
+                    request: AsyncHTTPClient.HTTPExecutableRequest,
+                    promise: NIOCore.EventLoopPromise<Void>?
+                ) {
+                    XCTFail()
+                }
+
+                func finishRequestBodyStream(
+                    _ task: AsyncHTTPClient.HTTPExecutableRequest,
+                    promise: NIOCore.EventLoopPromise<Void>?
+                ) {
+                    XCTFail()
+                }
+
+                func demandResponseBodyStream(_: AsyncHTTPClient.HTTPExecutableRequest) {
+                    XCTFail()
+                }
+
+                func cancelRequest(_ task: AsyncHTTPClient.HTTPExecutableRequest) {
+                    task.fail(HTTPClientError.cancelled)
+                }
             }
 
-            XCTAssertEqual(queuer.hitCancelCount, 0)
-            await XCTAssertThrowsError(try await responseTask.value) {
-                XCTAssertEqual($0 as? HTTPClientError, .cancelled)
+            transaction.willExecuteRequest(Executor())
+
+            await XCTAssertThrowsError(try await responseTask.value) { error in
+                XCTAssertEqualTypeAndValue(error, HTTPClientError.deadlineExceeded)
             }
-            XCTAssertEqual(queuer.hitCancelCount, 1)
         }
-        #endif
     }
 
     func testResponseStreamingWorks() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -78,7 +138,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -100,11 +160,11 @@ final class TransactionTests: XCTestCase {
             XCTAssertEqual(response.headers, responseHead.headers)
             XCTAssertEqual(response.version, responseHead.version)
 
-            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 }.makeAsyncIterator())
+            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 })
+
+            XCTAssertFalse(executor.signalledDemandForResponseBody, "Demand was not signalled yet.")
 
             for i in 0..<100 {
-                XCTAssertFalse(executor.signalledDemandForResponseBody, "Demand was not signalled yet.")
-
                 async let part = iterator.next()
 
                 XCTAssertNoThrow(try executor.receiveResponseDemand())
@@ -115,7 +175,6 @@ final class TransactionTests: XCTestCase {
                 XCTAssertEqual(result, ByteBuffer(integer: i))
             }
 
-            XCTAssertFalse(executor.signalledDemandForResponseBody, "Demand was not signalled yet.")
             async let part = iterator.next()
             XCTAssertNoThrow(try executor.receiveResponseDemand())
             executor.resetResponseStreamDemandSignal()
@@ -123,12 +182,9 @@ final class TransactionTests: XCTestCase {
             let result = try await part
             XCTAssertNil(result)
         }
-        #endif
     }
 
     func testIgnoringResponseBodyWorks() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -141,7 +197,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return
             }
-            var tuple: (Transaction, Task<HTTPClientResponse, Error>)! = Transaction.makeWithResultTask(
+            var tuple: (Transaction, Task<HTTPClientResponse, Error>)! = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -174,12 +230,9 @@ final class TransactionTests: XCTestCase {
             transaction.receiveResponseBodyParts([ByteBuffer(string: "foo bar")])
             transaction.succeedRequest(nil)
         }
-        #endif
     }
 
     func testWriteBackpressureWorks() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -196,7 +249,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return XCTFail("Expected to have a request here.")
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -209,15 +262,17 @@ final class TransactionTests: XCTestCase {
                 XCTAssertFalse(streamWriter.hasDemand, "Did not expect to have demand yet")
 
                 transaction.resumeRequestBodyStream()
-                await streamWriter.demand() // wait's for the stream writer to signal demand
+                await streamWriter.demand()  // wait's for the stream writer to signal demand
                 transaction.pauseRequestBodyStream()
 
                 let part = ByteBuffer(integer: i)
                 streamWriter.write(part)
 
-                XCTAssertNoThrow(try executor.receiveRequestBody {
-                    XCTAssertEqual($0, part)
-                })
+                XCTAssertNoThrow(
+                    try executor.receiveRequestBody {
+                        XCTAssertEqual($0, part)
+                    }
+                )
             }
 
             transaction.resumeRequestBodyStream()
@@ -237,7 +292,7 @@ final class TransactionTests: XCTestCase {
             XCTAssertEqual(response.headers, responseHead.headers)
             XCTAssertEqual(response.version, responseHead.version)
 
-            let iterator = SharedIterator(response.body.makeAsyncIterator())
+            let iterator = SharedIterator(response.body)
 
             XCTAssertFalse(executor.signalledDemandForResponseBody, "Demand was not signalled yet.")
             async let part = iterator.next()
@@ -248,12 +303,9 @@ final class TransactionTests: XCTestCase {
             let result = try await part
             XCTAssertNil(result)
         }
-        #endif
     }
 
     func testSimpleGetRequest() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
             let eventLoop = eventLoopGroup.next()
@@ -265,11 +317,13 @@ final class TransactionTests: XCTestCase {
             let connectionCreator = TestConnectionCreator()
             let delegate = TestHTTP2ConnectionDelegate()
             var maybeHTTP2Connection: HTTP2Connection?
-            XCTAssertNoThrow(maybeHTTP2Connection = try connectionCreator.createHTTP2Connection(
-                to: httpBin.port,
-                delegate: delegate,
-                on: eventLoop
-            ))
+            XCTAssertNoThrow(
+                maybeHTTP2Connection = try connectionCreator.createHTTP2Connection(
+                    to: httpBin.port,
+                    delegate: delegate,
+                    on: eventLoop
+                )
+            )
             guard let http2Connection = maybeHTTP2Connection else {
                 return XCTFail("Expected to have an HTTP2 connection here.")
             }
@@ -282,7 +336,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return XCTFail("Expected to have a request here.")
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: eventLoopGroup.next()
             )
@@ -306,12 +360,9 @@ final class TransactionTests: XCTestCase {
                 RequestInfo(data: "", requestNumber: 1, connectionNumber: 0)
             )
         }
-        #endif
     }
 
     func testSimplePostRequest() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -324,7 +375,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return XCTFail("Expected to have a request here.")
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -332,9 +383,11 @@ final class TransactionTests: XCTestCase {
             let executor = MockRequestExecutor(eventLoop: embeddedEventLoop)
             executor.runRequest(transaction)
             executor.resumeRequestBodyStream()
-            XCTAssertNoThrow(try executor.receiveRequestBody {
-                XCTAssertEqual($0.getString(at: 0, length: $0.readableBytes), "Hello world!")
-            })
+            XCTAssertNoThrow(
+                try executor.receiveRequestBody {
+                    XCTAssertEqual($0.getString(at: 0, length: $0.readableBytes), "Hello world!")
+                }
+            )
             XCTAssertNoThrow(try executor.receiveEndOfStream())
 
             let responseHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: ["foo": "bar"])
@@ -346,12 +399,9 @@ final class TransactionTests: XCTestCase {
             XCTAssertEqual(response.version, .http1_1)
             XCTAssertEqual(response.headers, ["foo": "bar"])
         }
-        #endif
     }
 
     func testPostStreamFails() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
@@ -366,7 +416,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return XCTFail("Expected to have a request here.")
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -378,9 +428,11 @@ final class TransactionTests: XCTestCase {
             await writer.demand()
             writer.write(.init(string: "Hello world!"))
 
-            XCTAssertNoThrow(try executor.receiveRequestBody {
-                XCTAssertEqual($0.getString(at: 0, length: $0.readableBytes), "Hello world!")
-            })
+            XCTAssertNoThrow(
+                try executor.receiveRequestBody {
+                    XCTAssertEqual($0.getString(at: 0, length: $0.readableBytes), "Hello world!")
+                }
+            )
 
             XCTAssertFalse(executor.isCancelled)
             struct WriteError: Error, Equatable {}
@@ -391,13 +443,10 @@ final class TransactionTests: XCTestCase {
             }
             XCTAssertNoThrow(try executor.receiveCancellation())
         }
-        #endif
     }
 
     func testResponseStreamFails() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
-        XCTAsyncTest {
+        XCTAsyncTest(timeout: 30) {
             let embeddedEventLoop = EmbeddedEventLoop()
             defer { XCTAssertNoThrow(try embeddedEventLoop.syncShutdownGracefully()) }
 
@@ -409,7 +458,7 @@ final class TransactionTests: XCTestCase {
             guard let preparedRequest = maybePreparedRequest else {
                 return
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: embeddedEventLoop
             )
@@ -427,17 +476,19 @@ final class TransactionTests: XCTestCase {
             transaction.receiveResponseHead(responseHead)
 
             let response = try await responseTask.value
+
             XCTAssertEqual(response.status, responseHead.status)
             XCTAssertEqual(response.headers, responseHead.headers)
             XCTAssertEqual(response.version, responseHead.version)
 
             XCTAssertFalse(executor.signalledDemandForResponseBody, "Demand was not signalled yet.")
-            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 }.makeAsyncIterator())
+            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 })
 
             async let part1 = iterator.next()
             XCTAssertNoThrow(try executor.receiveResponseDemand())
             executor.resetResponseStreamDemandSignal()
             transaction.receiveResponseBodyParts([ByteBuffer(integer: 123)])
+
             let result = try await part1
             XCTAssertEqual(result, ByteBuffer(integer: 123))
 
@@ -454,12 +505,9 @@ final class TransactionTests: XCTestCase {
                 XCTAssertEqual($0 as? HTTPClientError, .readTimeout)
             }
         }
-        #endif
     }
 
     func testBiDirectionalStreamingHTTP2() {
-        #if compiler(>=5.5.2) && canImport(_Concurrency)
-        guard #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *) else { return }
         XCTAsyncTest {
             let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
             let eventLoop = eventLoopGroup.next()
@@ -471,11 +519,13 @@ final class TransactionTests: XCTestCase {
             let connectionCreator = TestConnectionCreator()
             let delegate = TestHTTP2ConnectionDelegate()
             var maybeHTTP2Connection: HTTP2Connection?
-            XCTAssertNoThrow(maybeHTTP2Connection = try connectionCreator.createHTTP2Connection(
-                to: httpBin.port,
-                delegate: delegate,
-                on: eventLoop
-            ))
+            XCTAssertNoThrow(
+                maybeHTTP2Connection = try connectionCreator.createHTTP2Connection(
+                    to: httpBin.port,
+                    delegate: delegate,
+                    on: eventLoop
+                )
+            )
             guard let http2Connection = maybeHTTP2Connection else {
                 return XCTFail("Expected to have an HTTP2 connection here.")
             }
@@ -486,14 +536,14 @@ final class TransactionTests: XCTestCase {
             var request = HTTPClientRequest(url: "https://localhost:\(httpBin.port)/")
             request.method = .POST
             request.headers = ["host": "localhost:\(httpBin.port)"]
-            request.body = .stream(streamWriter, length: .known(800))
+            request.body = .stream(streamWriter, length: .known(Int64(800)))
 
             var maybePreparedRequest: PreparedRequest?
             XCTAssertNoThrow(maybePreparedRequest = try PreparedRequest(request))
             guard let preparedRequest = maybePreparedRequest else {
                 return
             }
-            let (transaction, responseTask) = Transaction.makeWithResultTask(
+            let (transaction, responseTask) = await Transaction.makeWithResultTask(
                 request: preparedRequest,
                 preferredEventLoop: eventLoopGroup.next()
             )
@@ -508,7 +558,7 @@ final class TransactionTests: XCTestCase {
             XCTAssertEqual(response.version, .http2)
             XCTAssertEqual(delegate.hitStreamClosed, 0)
 
-            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 }.makeAsyncIterator())
+            let iterator = SharedIterator(response.body.filter { $0.readableBytes > 0 })
 
             // at this point we can start to write to the stream and wait for the results
 
@@ -529,27 +579,70 @@ final class TransactionTests: XCTestCase {
             XCTAssertNil(final)
             XCTAssertEqual(delegate.hitStreamClosed, 1)
         }
-        #endif
     }
 }
-
-#if compiler(>=5.5.2) && canImport(_Concurrency)
 
 // This needs a small explanation. If an iterator is a struct, it can't be used across multiple
 // tasks. Since we want to wait for things to happen in tests, we need to `async let`, which creates
 // implicit tasks. Therefore we need to wrap our iterator struct.
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
-actor SharedIterator<Iterator: AsyncIteratorProtocol> {
-    private var iterator: Iterator
+actor SharedIterator<Wrapped: AsyncSequence> where Wrapped.Element: Sendable {
+    private var wrappedIterator: Wrapped.AsyncIterator
+    private var nextCallInProgress: Bool = false
 
-    init(_ iterator: Iterator) {
-        self.iterator = iterator
+    init(_ sequence: Wrapped) {
+        self.wrappedIterator = sequence.makeAsyncIterator()
     }
 
-    func next() async throws -> Iterator.Element? {
-        var iter = self.iterator
-        defer { self.iterator = iter }
+    func next() async throws -> Wrapped.Element? {
+        precondition(self.nextCallInProgress == false)
+        self.nextCallInProgress = true
+        var iter = self.wrappedIterator
+        defer {
+            precondition(self.nextCallInProgress == true)
+            self.nextCallInProgress = false
+            self.wrappedIterator = iter
+        }
         return try await iter.next()
+    }
+}
+
+/// non fail-able promise that only supports one observer
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+private actor Promise<Value> {
+    private enum State {
+        case initialised
+        case fulfilled(Value)
+    }
+
+    private var state: State = .initialised
+
+    private var observer: CheckedContinuation<Value, Never>?
+
+    init() {}
+
+    func fulfil(_ value: Value) {
+        switch self.state {
+        case .initialised:
+            self.state = .fulfilled(value)
+            self.observer?.resume(returning: value)
+        case .fulfilled:
+            preconditionFailure("\(Self.self) over fulfilled")
+        }
+    }
+
+    var value: Value {
+        get async {
+            switch self.state {
+            case .initialised:
+                return await withCheckedContinuation { (continuation: CheckedContinuation<Value, Never>) in
+                    precondition(self.observer == nil, "\(Self.self) supports only one observer")
+                    self.observer = continuation
+                }
+            case .fulfilled(let value):
+                return value
+            }
+        }
     }
 }
 
@@ -561,10 +654,11 @@ extension Transaction {
         logger: Logger = Logger(label: "test"),
         connectionDeadline: NIODeadline = .distantFuture,
         preferredEventLoop: EventLoop
-    ) -> (Transaction, _Concurrency.Task<HTTPClientResponse, Error>) {
-        let transactionPromise = preferredEventLoop.makePromise(of: Transaction.self)
-        let result = Task {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HTTPClientResponse, Error>) in
+    ) async -> (Transaction, _Concurrency.Task<HTTPClientResponse, Error>) {
+        let transactionPromise = Promise<Transaction>()
+        let task = Task {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<HTTPClientResponse, Error>) in
                 let transaction = Transaction(
                     request: request,
                     requestOptions: requestOptions,
@@ -573,13 +667,12 @@ extension Transaction {
                     preferredEventLoop: preferredEventLoop,
                     responseContinuation: continuation
                 )
-                transactionPromise.succeed(transaction)
+                Task {
+                    await transactionPromise.fulfil(transaction)
+                }
             }
         }
-        // the promise can never fail and it is therefore safe to force unwrap
-        let transaction = try! transactionPromise.futureResult.wait()
 
-        return (transaction, result)
+        return (await transactionPromise.value, task)
     }
 }
-#endif

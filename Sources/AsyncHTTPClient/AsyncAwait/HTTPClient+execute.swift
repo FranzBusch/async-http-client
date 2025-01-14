@@ -12,11 +12,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if compiler(>=5.5.2) && canImport(_Concurrency)
-import struct Foundation.URL
 import Logging
 import NIOCore
 import NIOHTTP1
+
+import struct Foundation.URL
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 extension HTTPClient {
@@ -78,19 +78,21 @@ extension HTTPClient {
 
         // this loop is there to follow potential redirects
         while true {
-            let preparedRequest = try HTTPClientRequest.Prepared(currentRequest)
-            let response = try await executeCancellable(preparedRequest, deadline: deadline, logger: logger)
+            let preparedRequest = try HTTPClientRequest.Prepared(currentRequest, dnsOverride: configuration.dnsOverride)
+            let response = try await self.executeCancellable(preparedRequest, deadline: deadline, logger: logger)
 
             guard var redirectState = currentRedirectState else {
                 // a `nil` redirectState means we should not follow redirects
                 return response
             }
 
-            guard let redirectURL = response.headers.extractRedirectTarget(
-                status: response.status,
-                originalURL: preparedRequest.url,
-                originalScheme: preparedRequest.poolKey.scheme
-            ) else {
+            guard
+                let redirectURL = response.headers.extractRedirectTarget(
+                    status: response.status,
+                    originalURL: preparedRequest.url,
+                    originalScheme: preparedRequest.poolKey.scheme
+                )
+            else {
                 // response does not want a redirect
                 return response
             }
@@ -121,31 +123,35 @@ extension HTTPClient {
     ) async throws -> HTTPClientResponse {
         let cancelHandler = TransactionCancelHandler()
 
-        return try await withTaskCancellationHandler(operation: { () async throws -> HTTPClientResponse in
-            let eventLoop = self.eventLoopGroup.any()
-            let deadlineTask = eventLoop.scheduleTask(deadline: deadline) {
-                cancelHandler.cancel(reason: .deadlineExceeded)
-            }
-            defer {
-                deadlineTask.cancel()
-            }
-            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HTTPClientResponse, Swift.Error>) -> Void in
-                let transaction = Transaction(
-                    request: request,
-                    requestOptions: .init(idleReadTimeout: nil),
-                    logger: logger,
-                    connectionDeadline: deadline,
-                    preferredEventLoop: eventLoop,
-                    responseContinuation: continuation
-                )
+        return try await withTaskCancellationHandler(
+            operation: { () async throws -> HTTPClientResponse in
+                let eventLoop = self.eventLoopGroup.any()
+                let deadlineTask = eventLoop.scheduleTask(deadline: deadline) {
+                    cancelHandler.cancel(reason: .deadlineExceeded)
+                }
+                defer {
+                    deadlineTask.cancel()
+                }
+                return try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<HTTPClientResponse, Swift.Error>) -> Void in
+                    let transaction = Transaction(
+                        request: request,
+                        requestOptions: .fromClientConfiguration(self.configuration),
+                        logger: logger,
+                        connectionDeadline: .now() + (self.configuration.timeout.connectionCreationTimeout),
+                        preferredEventLoop: eventLoop,
+                        responseContinuation: continuation
+                    )
 
-                cancelHandler.registerTransaction(transaction)
+                    cancelHandler.registerTransaction(transaction)
 
-                self.poolManager.executeRequest(transaction)
+                    self.poolManager.executeRequest(transaction)
+                }
+            },
+            onCancel: {
+                cancelHandler.cancel(reason: .taskCanceled)
             }
-        }, onCancel: {
-            cancelHandler.cancel(reason: .taskCanceled)
-        })
+        )
     }
 }
 
@@ -215,5 +221,3 @@ private actor TransactionCancelHandler {
         }
     }
 }
-
-#endif

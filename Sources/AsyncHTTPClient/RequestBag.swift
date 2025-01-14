@@ -19,16 +19,29 @@ import NIOHTTP1
 import NIOSSL
 
 final class RequestBag<Delegate: HTTPClientResponseDelegate> {
+    /// Defends against the call stack getting too large when consuming body parts.
+    ///
+    /// If the response body comes in lots of tiny chunks, we'll deliver those tiny chunks to users
+    /// one at a time.
+    private static var maxConsumeBodyPartStackDepth: Int {
+        50
+    }
+
+    let poolKey: ConnectionPool.Key
+
     let task: HTTPClient.Task<Delegate.Response>
     var eventLoop: EventLoop {
         self.task.eventLoop
     }
 
     private let delegate: Delegate
-    private let request: HTTPClient.Request
+    private var request: HTTPClient.Request
 
     // the request state is synchronized on the task eventLoop
     private var state: StateMachine
+
+    // the consume body part stack depth is synchronized on the task event loop.
+    private var consumeBodyPartStackDepth: Int
 
     // MARK: HTTPClientTask properties
 
@@ -45,16 +58,20 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
 
     let eventLoopPreference: HTTPClient.EventLoopPreference
 
-    init(request: HTTPClient.Request,
-         eventLoopPreference: HTTPClient.EventLoopPreference,
-         task: HTTPClient.Task<Delegate.Response>,
-         redirectHandler: RedirectHandler<Delegate.Response>?,
-         connectionDeadline: NIODeadline,
-         requestOptions: RequestOptions,
-         delegate: Delegate) throws {
+    init(
+        request: HTTPClient.Request,
+        eventLoopPreference: HTTPClient.EventLoopPreference,
+        task: HTTPClient.Task<Delegate.Response>,
+        redirectHandler: RedirectHandler<Delegate.Response>?,
+        connectionDeadline: NIODeadline,
+        requestOptions: RequestOptions,
+        delegate: Delegate
+    ) throws {
+        self.poolKey = .init(request, dnsOverride: requestOptions.dnsOverride)
         self.eventLoopPreference = eventLoopPreference
         self.task = task
         self.state = .init(redirectHandler: redirectHandler)
+        self.consumeBodyPartStackDepth = 0
         self.request = request
         self.connectionDeadline = connectionDeadline
         self.requestOptions = requestOptions
@@ -81,8 +98,16 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
 
     private func willExecuteRequest0(_ executor: HTTPRequestExecutor) {
         self.task.eventLoop.assertInEventLoop()
-        if !self.state.willExecuteRequest(executor) {
-            return executor.cancelRequest(self)
+        let action = self.state.willExecuteRequest(executor)
+        switch action {
+        case .cancelExecuter(let executor):
+            executor.cancelRequest(self)
+        case .failTaskAndCancelExecutor(let error, let executor):
+            self.delegate.didReceiveError(task: self.task, error)
+            self.task.fail(with: error, delegateType: Delegate.self)
+            executor.cancelRequest(self)
+        case .none:
+            break
         }
     }
 
@@ -106,6 +131,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
             guard let body = self.request.body else {
                 preconditionFailure("Expected to have a body, if the `HTTPRequestStateMachine` resume a request stream")
             }
+            self.request.body = nil
 
             let writer = HTTPClient.Body.StreamWriter {
                 self.writeNextRequestPart($0)
@@ -154,8 +180,11 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
             return self.task.eventLoop.makeFailedFuture(error)
 
         case .write(let part, let writer, let future):
-            writer.writeRequestBodyPart(part, request: self)
-            self.delegate.didSendRequestPart(task: self.task, part)
+            let promise = self.task.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenSuccess {
+                self.delegate.didSendRequestPart(task: self.task, part)
+            }
+            writer.writeRequestBodyPart(part, request: self, promise: promise)
             return future
         }
     }
@@ -168,11 +197,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
         switch action {
         case .none:
             break
-        case .forwardStreamFinished(let writer, let promise):
-            writer.finishRequestBodyStream(self)
-            promise?.succeed(())
-
-            self.delegate.didSendRequest(task: self.task)
+        case .forwardStreamFinished(let writer, let writerPromise):
+            let promise = writerPromise ?? self.task.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenSuccess {
+                self.delegate.didSendRequest(task: self.task)
+            }
+            writer.finishRequestBodyStream(self, promise: promise)
 
         case .forwardStreamFailureAndFailTask(let writer, let error, let promise):
             writer.cancelRequest(self)
@@ -196,33 +226,49 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
         self.task.eventLoop.assertInEventLoop()
 
         // runs most likely on channel eventLoop
-        let forwardToDelegate = self.state.receiveResponseHead(head)
+        switch self.state.receiveResponseHead(head) {
+        case .none:
+            break
 
-        guard forwardToDelegate else { return }
+        case .signalBodyDemand(let executor):
+            executor.demandResponseBodyStream(self)
 
-        self.delegate.didReceiveHead(task: self.task, head)
-            .hop(to: self.task.eventLoop)
-            .whenComplete { result in
-                // After the head received, let's start to consume body data
-                self.consumeMoreBodyData0(resultOfPreviousConsume: result)
-            }
+        case .redirect(let executor, let handler, let head, let newURL):
+            handler.redirect(status: head.status, to: newURL, promise: self.task.promise)
+            executor.cancelRequest(self)
+
+        case .forwardResponseHead(let head):
+            self.delegate.didReceiveHead(task: self.task, head)
+                .hop(to: self.task.eventLoop)
+                .whenComplete { result in
+                    // After the head received, let's start to consume body data
+                    self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                }
+        }
     }
 
     private func receiveResponseBodyParts0(_ buffer: CircularBuffer<ByteBuffer>) {
         self.task.eventLoop.assertInEventLoop()
 
-        let maybeForwardBuffer = self.state.receiveResponseBodyParts(buffer)
+        switch self.state.receiveResponseBodyParts(buffer) {
+        case .none:
+            break
 
-        guard let forwardBuffer = maybeForwardBuffer else {
-            return
+        case .signalBodyDemand(let executor):
+            executor.demandResponseBodyStream(self)
+
+        case .redirect(let executor, let handler, let head, let newURL):
+            handler.redirect(status: head.status, to: newURL, promise: self.task.promise)
+            executor.cancelRequest(self)
+
+        case .forwardResponsePart(let part):
+            self.delegate.didReceiveBodyPart(task: self.task, part)
+                .hop(to: self.task.eventLoop)
+                .whenComplete { result in
+                    // on task el
+                    self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                }
         }
-
-        self.delegate.didReceiveBodyPart(task: self.task, forwardBuffer)
-            .hop(to: self.task.eventLoop)
-            .whenComplete { result in
-                // on task el
-                self.consumeMoreBodyData0(resultOfPreviousConsume: result)
-            }
     }
 
     private func succeedRequest0(_ buffer: CircularBuffer<ByteBuffer>?) {
@@ -236,14 +282,7 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
             self.delegate.didReceiveBodyPart(task: self.task, buffer)
                 .hop(to: self.task.eventLoop)
                 .whenComplete {
-                    switch $0 {
-                    case .success:
-                        self.consumeMoreBodyData0(resultOfPreviousConsume: $0)
-                    case .failure(let error):
-                        // if in the response stream consumption an error has occurred, we need to
-                        // cancel the running request and fail the task.
-                        self.fail(error)
-                    }
+                    self.consumeMoreBodyData0(resultOfPreviousConsume: $0)
                 }
 
         case .succeedRequest:
@@ -262,18 +301,36 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
     private func consumeMoreBodyData0(resultOfPreviousConsume result: Result<Void, Error>) {
         self.task.eventLoop.assertInEventLoop()
 
+        // We get defensive here about the maximum stack depth. It's possible for the `didReceiveBodyPart`
+        // future to be returned to us completed. If it is, we will recurse back into this method. To
+        // break that recursion we have a max stack depth which we increment and decrement in this method:
+        // if it gets too large, instead of recurring we'll insert an `eventLoop.execute`, which will
+        // manually break the recursion and unwind the stack.
+        //
+        // Note that we don't bother starting this at the various other call sites that _begin_ stacks
+        // that risk ending up in this loop. That's because we don't need an accurate count: our limit is
+        // a best-effort target anyway, one stack frame here or there does not put us at risk. We're just
+        // trying to prevent ourselves looping out of control.
+        self.consumeBodyPartStackDepth += 1
+        defer {
+            self.consumeBodyPartStackDepth -= 1
+            assert(self.consumeBodyPartStackDepth >= 0)
+        }
+
         let consumptionAction = self.state.consumeMoreBodyData(resultOfPreviousConsume: result)
 
         switch consumptionAction {
         case .consume(let byteBuffer):
             self.delegate.didReceiveBodyPart(task: self.task, byteBuffer)
                 .hop(to: self.task.eventLoop)
-                .whenComplete {
-                    switch $0 {
-                    case .success:
-                        self.consumeMoreBodyData0(resultOfPreviousConsume: $0)
-                    case .failure(let error):
-                        self.fail(error)
+                .whenComplete { result in
+                    if self.consumeBodyPartStackDepth < Self.maxConsumeBodyPartStackDepth {
+                        self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                    } else {
+                        // We need to unwind the stack, let's take a break.
+                        self.task.eventLoop.execute {
+                            self.consumeMoreBodyData0(resultOfPreviousConsume: result)
+                        }
                     }
                 }
 
@@ -300,8 +357,12 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
 
         let action = self.state.fail(error)
 
+        self.executeFailAction0(action)
+    }
+
+    private func executeFailAction0(_ action: RequestBag<Delegate>.StateMachine.FailAction) {
         switch action {
-        case .failTask(let scheduler, let executor):
+        case .failTask(let error, let scheduler, let executor):
             scheduler?.cancelRequest(self)
             executor?.cancelRequest(self)
             self.failTask0(error)
@@ -311,13 +372,31 @@ final class RequestBag<Delegate: HTTPClientResponseDelegate> {
             break
         }
     }
-}
 
-extension RequestBag: HTTPSchedulableRequest {
-    var poolKey: ConnectionPool.Key {
-        ConnectionPool.Key(self.request)
+    func deadlineExceeded0() {
+        self.task.eventLoop.assertInEventLoop()
+        let action = self.state.deadlineExceeded()
+
+        switch action {
+        case .cancelScheduler(let scheduler):
+            scheduler?.cancelRequest(self)
+        case .fail(let failAction):
+            self.executeFailAction0(failAction)
+        }
     }
 
+    func deadlineExceeded() {
+        if self.task.eventLoop.inEventLoop {
+            self.deadlineExceeded0()
+        } else {
+            self.task.eventLoop.execute {
+                self.deadlineExceeded0()
+            }
+        }
+    }
+}
+
+extension RequestBag: HTTPSchedulableRequest, HTTPClientTaskDelegate {
     var tlsConfiguration: TLSConfiguration? {
         self.request.tlsConfiguration
     }
@@ -358,8 +437,8 @@ extension RequestBag: HTTPExecutableRequest {
         case .indifferent:
             return self.task.eventLoop
         case .delegate(let eventLoop),
-             .delegateAndChannel(on: let eventLoop),
-             .testOnly_exact(channelOn: let eventLoop, delegateOn: _):
+            .delegateAndChannel(on: let eventLoop),
+            .testOnly_exact(channelOn: let eventLoop, delegateOn: _):
             return eventLoop
         }
     }
@@ -430,18 +509,6 @@ extension RequestBag: HTTPExecutableRequest {
         } else {
             self.task.eventLoop.execute {
                 self.succeedRequest0(buffer)
-            }
-        }
-    }
-}
-
-extension RequestBag: HTTPClientTaskDelegate {
-    func cancel() {
-        if self.task.eventLoop.inEventLoop {
-            self.fail0(HTTPClientError.cancelled)
-        } else {
-            self.task.eventLoop.execute {
-                self.fail0(HTTPClientError.cancelled)
             }
         }
     }

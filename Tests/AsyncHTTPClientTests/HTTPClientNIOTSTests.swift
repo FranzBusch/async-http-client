@@ -12,15 +12,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-@testable import AsyncHTTPClient
-#if canImport(Network)
-import Network
-#endif
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 import NIOSSL
 import NIOTransportServices
 import XCTest
+
+@testable import AsyncHTTPClient
+
+#if canImport(Network)
+import Network
+#endif
 
 class HTTPClientNIOTSTests: XCTestCase {
     var clientGroup: EventLoopGroup!
@@ -37,7 +40,7 @@ class HTTPClientNIOTSTests: XCTestCase {
     }
 
     func testCorrectEventLoopGroup() {
-        let httpClient = HTTPClient(eventLoopGroupProvider: .createNew)
+        let httpClient = HTTPClient(eventLoopGroupProvider: .singleton)
         defer {
             XCTAssertNoThrow(try httpClient.syncShutdown())
         }
@@ -54,7 +57,12 @@ class HTTPClientNIOTSTests: XCTestCase {
         guard isTestingNIOTS() else { return }
 
         let httpBin = HTTPBin(.http1_1(ssl: true))
-        let httpClient = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup))
+        let config = HTTPClient.Configuration()
+            .enableFastFailureModeForTesting()
+        let httpClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: config
+        )
         defer {
             XCTAssertNoThrow(try httpClient.syncShutdown(requiresCleanClose: true))
             XCTAssertNoThrow(try httpBin.shutdown())
@@ -65,8 +73,10 @@ class HTTPClientNIOTSTests: XCTestCase {
             _ = try httpClient.get(url: "https://localhost:\(httpBin.port)/get").wait()
             XCTFail("This should have failed")
         } catch let error as HTTPClient.NWTLSError {
-            XCTAssert(error.status == errSSLHandshakeFail || error.status == errSSLBadCert,
-                      "unexpected NWTLSError with status \(error.status)")
+            XCTAssert(
+                error.status == errSSLHandshakeFail || error.status == errSSLBadCert,
+                "unexpected NWTLSError with status \(error.status)"
+            )
         } catch {
             XCTFail("Error should have been NWTLSError not \(type(of: error))")
         }
@@ -75,12 +85,17 @@ class HTTPClientNIOTSTests: XCTestCase {
         #endif
     }
 
-    func testConnectionFailError() {
+    func testConnectionFailsFastError() {
         guard isTestingNIOTS() else { return }
-        let httpBin = HTTPBin(.http1_1(ssl: true))
-        let httpClient = HTTPClient(eventLoopGroupProvider: .shared(self.clientGroup),
-                                    configuration: .init(timeout: .init(connect: .milliseconds(100),
-                                                                        read: .milliseconds(100))))
+        #if canImport(Network)
+        let httpBin = HTTPBin(.http1_1(ssl: false))
+        let config = HTTPClient.Configuration()
+            .enableFastFailureModeForTesting()
+
+        let httpClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: config
+        )
 
         defer {
             XCTAssertNoThrow(try httpClient.syncShutdown(requiresCleanClose: true))
@@ -89,9 +104,43 @@ class HTTPClientNIOTSTests: XCTestCase {
         let port = httpBin.port
         XCTAssertNoThrow(try httpBin.shutdown())
 
-        XCTAssertThrowsError(try httpClient.get(url: "https://localhost:\(port)/get").wait()) {
-            XCTAssertEqual($0 as? HTTPClientError, .connectTimeout)
+        XCTAssertThrowsError(try httpClient.get(url: "http://localhost:\(port)/get").wait()) {
+            XCTAssertTrue($0 is NWError)
         }
+        #endif
+    }
+
+    func testConnectionFailError() {
+        guard isTestingNIOTS() else { return }
+        #if canImport(Network)
+        let httpBin = HTTPBin(.http1_1(ssl: false))
+        let httpClient = HTTPClient(
+            eventLoopGroupProvider: .shared(self.clientGroup),
+            configuration: .init(
+                timeout: .init(
+                    connect: .milliseconds(100),
+                    read: .milliseconds(100)
+                )
+            )
+        )
+
+        defer {
+            XCTAssertNoThrow(try httpClient.syncShutdown(requiresCleanClose: true))
+        }
+
+        let port = httpBin.port
+        XCTAssertNoThrow(try httpBin.shutdown())
+
+        XCTAssertThrowsError(try httpClient.get(url: "http://localhost:\(port)/get").wait()) {
+            if let httpClientError = $0 as? HTTPClientError {
+                XCTAssertEqual(httpClientError, .connectTimeout)
+            } else if let posixError = $0 as? HTTPClient.NWPOSIXError {
+                XCTAssertEqual(posixError.errorCode, .ECONNREFUSED)
+            } else {
+                XCTFail("unexpected error \($0)")
+            }
+        }
+        #endif
     }
 
     func testTLSVersionError() {
@@ -102,9 +151,12 @@ class HTTPClientNIOTSTests: XCTestCase {
         tlsConfig.certificateVerification = .none
         tlsConfig.minimumTLSVersion = .tlsv11
         tlsConfig.maximumTLSVersion = .tlsv1
+
+        let clientConfig = HTTPClient.Configuration(tlsConfiguration: tlsConfig)
+            .enableFastFailureModeForTesting()
         let httpClient = HTTPClient(
             eventLoopGroupProvider: .shared(self.clientGroup),
-            configuration: .init(tlsConfiguration: tlsConfig)
+            configuration: clientConfig
         )
         defer {
             XCTAssertNoThrow(try httpClient.syncShutdown(requiresCleanClose: true))
@@ -124,7 +176,7 @@ class HTTPClientNIOTSTests: XCTestCase {
             var tlsConfig = TLSConfiguration.makeClientConfiguration()
             tlsConfig.trustRoots = .file("not/a/certificate")
 
-            XCTAssertThrowsError(try tlsConfig.getNWProtocolTLSOptions()) { error in
+            XCTAssertThrowsError(try tlsConfig.getNWProtocolTLSOptions(serverNameIndicatorOverride: nil)) { error in
                 switch error {
                 case let error as NIOSSL.NIOSSLError where error == .failedToLoadCertificate:
                     break

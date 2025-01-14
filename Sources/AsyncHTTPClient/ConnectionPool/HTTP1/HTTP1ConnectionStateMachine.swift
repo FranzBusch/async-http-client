@@ -28,21 +28,44 @@ struct HTTP1ConnectionStateMachine {
 
     enum Action {
         /// A action to execute, when we consider a request "done".
-        enum FinalStreamAction {
+        enum FinalSuccessfulStreamAction {
             /// Close the connection
             case close
             /// If the server has replied, with a status of 200...300 before all data was sent, a request is considered succeeded,
             /// as soon as we wrote the request end onto the wire.
-            case sendRequestEnd
+            ///
+            /// The promise is an optional write promise.
+            ///
+            /// `shouldClose` records whether we have attached a Connection: close header to this request, and so the connection should
+            /// be terminated
+            case sendRequestEnd(EventLoopPromise<Void>?, shouldClose: Bool)
             /// Inform an observer that the connection has become idle
             case informConnectionIsIdle
+        }
+
+        /// A action to execute, when we consider a request "done".
+        enum FinalFailedStreamAction {
+            /// Close the connection
+            ///
+            /// The promise is an optional write promise.
+            case close(EventLoopPromise<Void>?)
+            /// Inform an observer that the connection has become idle
+            case informConnectionIsIdle
+            /// Fail the write promise
+            case failWritePromise(EventLoopPromise<Void>?)
             /// Do nothing.
             case none
         }
 
-        case sendRequestHead(HTTPRequestHead, startBody: Bool)
-        case sendBodyPart(IOData)
-        case sendRequestEnd
+        case sendRequestHead(HTTPRequestHead, sendEnd: Bool)
+        case notifyRequestHeadSendSuccessfully(
+            resumeRequestBodyStream: Bool,
+            startIdleTimer: Bool
+        )
+        case sendBodyPart(IOData, EventLoopPromise<Void>?)
+        case sendRequestEnd(EventLoopPromise<Void>?)
+        case failSendBodyPart(Error, EventLoopPromise<Void>?)
+        case failSendStreamFinished(Error, EventLoopPromise<Void>?)
 
         case pauseRequestBodyStream
         case resumeRequestBodyStream
@@ -50,8 +73,8 @@ struct HTTP1ConnectionStateMachine {
         case forwardResponseHead(HTTPResponseHead, pauseRequestBodyStream: Bool)
         case forwardResponseBodyParts(CircularBuffer<ByteBuffer>)
 
-        case failRequest(Error, FinalStreamAction)
-        case succeedRequest(FinalStreamAction, CircularBuffer<ByteBuffer>)
+        case failRequest(Error, FinalFailedStreamAction)
+        case succeedRequest(FinalSuccessfulStreamAction, CircularBuffer<ByteBuffer>)
 
         case read
         case close
@@ -83,14 +106,14 @@ struct HTTP1ConnectionStateMachine {
             return .wait
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
     mutating func channelInactive() -> Action {
         switch self.state {
         case .initialized:
-            preconditionFailure("A channel that isn't active, must not become inactive")
+            fatalError("A channel that isn't active, must not become inactive")
 
         case .inRequest(var requestStateMachine, close: _):
             return self.avoidingStateMachineCoW { state -> Action in
@@ -107,7 +130,7 @@ struct HTTP1ConnectionStateMachine {
             return .wait
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
@@ -117,7 +140,7 @@ struct HTTP1ConnectionStateMachine {
             self.state = .closed
             return .fireChannelError(error, closeConnection: false)
 
-        case .inRequest(var requestStateMachine, close: let close):
+        case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
                 let action = requestStateMachine.errorHappened(error)
                 state = .inRequest(requestStateMachine, close: close)
@@ -132,7 +155,7 @@ struct HTTP1ConnectionStateMachine {
             return .fireChannelError(error, closeConnection: false)
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
@@ -150,7 +173,7 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
@@ -159,15 +182,15 @@ struct HTTP1ConnectionStateMachine {
         metadata: RequestFramingMetadata
     ) -> Action {
         switch self.state {
-        case .initialized, .closing, .inRequest:
+        case .initialized, .inRequest:
             // These states are unreachable as the connection pool state machine has put the
             // connection into these states. In other words the connection pool state machine must
             // be aware about these states before the connection itself. For this reason the
             // connection pool state machine must not send a new request to the connection, if the
             // connection is `.initialized`, `.closing` or `.inRequest`
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
 
-        case .closed:
+        case .closing, .closed:
             // The remote may have closed the connection and the connection pool state machine
             // was not updated yet because of a race condition. New request vs. marking connection
             // as closed.
@@ -185,29 +208,29 @@ struct HTTP1ConnectionStateMachine {
             return self.state.modify(with: action)
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
-    mutating func requestStreamPartReceived(_ part: IOData) -> Action {
+    mutating func requestStreamPartReceived(_ part: IOData, promise: EventLoopPromise<Void>?) -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
-            let action = requestStateMachine.requestStreamPartReceived(part)
+            let action = requestStateMachine.requestStreamPartReceived(part, promise: promise)
             state = .inRequest(requestStateMachine, close: close)
             return state.modify(with: action)
         }
     }
 
-    mutating func requestStreamFinished() -> Action {
+    mutating func requestStreamFinished(promise: EventLoopPromise<Void>?) -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
-            let action = requestStateMachine.requestStreamFinished()
+            let action = requestStateMachine.requestStreamFinished(promise: promise)
             state = .inRequest(requestStateMachine, close: close)
             return state.modify(with: action)
         }
@@ -216,7 +239,9 @@ struct HTTP1ConnectionStateMachine {
     mutating func requestCancelled(closeConnection: Bool) -> Action {
         switch self.state {
         case .initialized:
-            preconditionFailure("This event must only happen, if the connection is leased. During startup this is impossible. Invalid state: \(self.state)")
+            fatalError(
+                "This event must only happen, if the connection is leased. During startup this is impossible. Invalid state: \(self.state)"
+            )
 
         case .idle:
             if closeConnection {
@@ -226,7 +251,7 @@ struct HTTP1ConnectionStateMachine {
                 return .wait
             }
 
-        case .inRequest(var requestStateMachine, close: let close):
+        case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
                 let action = requestStateMachine.requestCancelled()
                 state = .inRequest(requestStateMachine, close: close || closeConnection)
@@ -237,7 +262,7 @@ struct HTTP1ConnectionStateMachine {
             return .wait
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
@@ -246,7 +271,7 @@ struct HTTP1ConnectionStateMachine {
     mutating func read() -> Action {
         switch self.state {
         case .initialized:
-            preconditionFailure("Why should we read something, if we are not connected yet")
+            fatalError("Why should we read something, if we are not connected yet")
         case .idle:
             return .read
         case .inRequest(var requestStateMachine, let close):
@@ -261,14 +286,14 @@ struct HTTP1ConnectionStateMachine {
             return .read
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
     mutating func channelRead(_ part: HTTPClientResponsePart) -> Action {
         switch self.state {
         case .initialized, .idle:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
 
         case .inRequest(var requestStateMachine, var close):
             return self.avoidingStateMachineCoW { state -> Action in
@@ -287,7 +312,7 @@ struct HTTP1ConnectionStateMachine {
             return .wait
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
@@ -304,13 +329,13 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 
     mutating func demandMoreResponseBodyParts() -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
@@ -322,11 +347,34 @@ struct HTTP1ConnectionStateMachine {
 
     mutating func idleReadTimeoutTriggered() -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
             let action = requestStateMachine.idleReadTimeoutTriggered()
+            state = .inRequest(requestStateMachine, close: close)
+            return state.modify(with: action)
+        }
+    }
+
+    mutating func idleWriteTimeoutTriggered() -> Action {
+        guard case .inRequest(var requestStateMachine, let close) = self.state else {
+            preconditionFailure("Invalid state: \(self.state)")
+        }
+
+        return self.avoidingStateMachineCoW { state -> Action in
+            let action = requestStateMachine.idleWriteTimeoutTriggered()
+            state = .inRequest(requestStateMachine, close: close)
+            return state.modify(with: action)
+        }
+    }
+
+    mutating func headSent() -> Action {
+        guard case .inRequest(var requestStateMachine, let close) = self.state else {
+            return .wait
+        }
+        return self.avoidingStateMachineCoW { state in
+            let action = requestStateMachine.headSent()
             state = .inRequest(requestStateMachine, close: close)
             return state.modify(with: action)
         }
@@ -369,34 +417,41 @@ extension HTTP1ConnectionStateMachine {
 }
 
 extension HTTP1ConnectionStateMachine.State {
-    fileprivate mutating func modify(with action: HTTPRequestStateMachine.Action) -> HTTP1ConnectionStateMachine.Action {
+    fileprivate mutating func modify(with action: HTTPRequestStateMachine.Action) -> HTTP1ConnectionStateMachine.Action
+    {
         switch action {
-        case .sendRequestHead(let head, let startBody):
-            return .sendRequestHead(head, startBody: startBody)
+        case .sendRequestHead(let head, let sendEnd):
+            return .sendRequestHead(head, sendEnd: sendEnd)
+        case .notifyRequestHeadSendSuccessfully(let resumeRequestBodyStream, let startIdleTimer):
+            return .notifyRequestHeadSendSuccessfully(
+                resumeRequestBodyStream: resumeRequestBodyStream,
+                startIdleTimer: startIdleTimer
+            )
         case .pauseRequestBodyStream:
             return .pauseRequestBodyStream
         case .resumeRequestBodyStream:
             return .resumeRequestBodyStream
-        case .sendBodyPart(let part):
-            return .sendBodyPart(part)
-        case .sendRequestEnd:
-            return .sendRequestEnd
+        case .sendBodyPart(let part, let writePromise):
+            return .sendBodyPart(part, writePromise)
+        case .sendRequestEnd(let writePromise):
+            return .sendRequestEnd(writePromise)
         case .forwardResponseHead(let head, let pauseRequestBodyStream):
             return .forwardResponseHead(head, pauseRequestBodyStream: pauseRequestBodyStream)
         case .forwardResponseBodyParts(let parts):
             return .forwardResponseBodyParts(parts)
         case .succeedRequest(let finalAction, let finalParts):
             guard case .inRequest(_, close: let close) = self else {
-                preconditionFailure("Invalid state: \(self)")
+                fatalError("Invalid state: \(self)")
             }
 
-            let newFinalAction: HTTP1ConnectionStateMachine.Action.FinalStreamAction
+            let newFinalAction: HTTP1ConnectionStateMachine.Action.FinalSuccessfulStreamAction
             switch finalAction {
             case .close:
                 self = .closing
                 newFinalAction = .close
-            case .sendRequestEnd:
-                newFinalAction = .sendRequestEnd
+            case .sendRequestEnd(let writePromise):
+                self = .idle
+                newFinalAction = .sendRequestEnd(writePromise, shouldClose: close)
             case .none:
                 self = .idle
                 newFinalAction = close ? .close : .informConnectionIsIdle
@@ -406,13 +461,16 @@ extension HTTP1ConnectionStateMachine.State {
         case .failRequest(let error, let finalAction):
             switch self {
             case .initialized:
-                preconditionFailure("Invalid state: \(self)")
+                fatalError("Invalid state: \(self)")
             case .idle:
-                preconditionFailure("How can we fail a task, if we are idle")
-            case .inRequest(_, close: let close):
-                if close || finalAction == .close {
+                fatalError("How can we fail a task, if we are idle")
+            case .inRequest(_, let close):
+                if case .close(let promise) = finalAction {
                     self = .closing
-                    return .failRequest(error, .close)
+                    return .failRequest(error, .close(promise))
+                } else if close {
+                    self = .closing
+                    return .failRequest(error, .close(nil))
                 } else {
                     self = .idle
                     return .failRequest(error, .informConnectionIsIdle)
@@ -425,7 +483,7 @@ extension HTTP1ConnectionStateMachine.State {
                 return .failRequest(error, .none)
 
             case .modifying:
-                preconditionFailure("Invalid state: \(self)")
+                fatalError("Invalid state: \(self)")
             }
 
         case .read:
@@ -433,6 +491,12 @@ extension HTTP1ConnectionStateMachine.State {
 
         case .wait:
             return .wait
+
+        case .failSendBodyPart(let error, let writePromise):
+            return .failSendBodyPart(error, writePromise)
+
+        case .failSendStreamFinished(let error, let writePromise):
+            return .failSendStreamFinished(error, writePromise)
         }
     }
 }
@@ -444,14 +508,14 @@ extension HTTP1ConnectionStateMachine: CustomStringConvertible {
             return ".initialized"
         case .idle:
             return ".idle"
-        case .inRequest(let request, close: let close):
+        case .inRequest(let request, let close):
             return ".inRequest(\(request), closeAfterRequest: \(close))"
         case .closing:
             return ".closing"
         case .closed:
             return ".closed"
         case .modifying:
-            preconditionFailure("Invalid state: \(self.state)")
+            fatalError("Invalid state: \(self.state)")
         }
     }
 }
